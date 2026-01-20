@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Python packaging / build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# PyCharm / IntelliJ
+.idea/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# PyBullet / simulation artifacts
+*.bullet
+
+# Docker / runtime
+*.pid
+
