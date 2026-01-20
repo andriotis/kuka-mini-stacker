@@ -1,5 +1,5 @@
 """
-env_test.py - A modern PyBullet + Gymnasium robotics simulation.
+env_test.py - Truncated 3-DOF KUKA IIWA with gripper reaching environment.
 
 MODERN DEEP RL STACK (2025):
 This script demonstrates a fully modern implementation using:
@@ -11,6 +11,9 @@ NO LEGACY DEPENDENCIES:
 - No 'gym' library (deprecated since 2022)
 - No 'pybullet_envs' package (legacy, incompatible with modern Gymnasium)
 - Pure Gymnasium API with direct PyBullet integration
+
+The robot uses a truncated 3-DOF KUKA IIWA arm with a prismatic gripper.
+The URDF file (kuka_3dof.urdf) references meshes from pybullet_kuka/kuka_iiwa/meshes/.
 """
 
 import gymnasium as gym
@@ -28,410 +31,330 @@ TARGET_FPS = 60.0  # Target frames per second for visual playback
 SIMULATION_STEPS = 1000  # Number of simulation steps to run
 MAX_EPISODE_STEPS = 150  # Maximum steps per episode
 
+# KUKA-specific constants for the truncated 3-DOF KUKA + gripper reaching environment
+KUKA_ARM_JOINT_COUNT = 3  # Truncated KUKA arm has 3 revolute joints
+KUKA_ACTION_DIM = 4  # 3 arm joint deltas + 1 gripper action
+KUKA_MAX_EPISODE_STEPS = 200
+KUKA_EE_LINK_INDEX = 3  # Link index for gripper_body (end-effector)
+KUKA_JOINT_DELTA_SCALE = 0.05  # Radians per step for arm joints
+KUKA_GRIPPER_DELTA_SCALE = 0.01  # Meters per step for gripper
 
-class PyBulletReacherEnv(gym.Env):
+
+class KukaPickPlaceEnv(gym.Env):
     """
-    A modern Gymnasium environment for a 2-joint robot arm reaching task.
+    Truncated 3-DOF KUKA IIWA with gripper - reaching environment.
 
-    This environment wraps PyBullet directly, demonstrating how to create
-    a custom Gymnasium environment without legacy dependencies.
+    This environment loads a truncated KUKA IIWA URDF (3 arm joints + prismatic
+    gripper) with authentic KUKA mesh visuals. The task is reaching: move the
+    gripper to a target position.
 
-    The task: A 2-joint arm tries to reach a randomly positioned target.
+    Action space is 4-D:
+    - First 3 components: arm joint position deltas
+    - 4th component: gripper open/close (positive = open, negative = close)
+
+    Observation space is 16-D:
+    [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
-    def __init__(self, render_mode: Optional[str] = None):
-        """
-        Initialize the PyBullet Reacher environment.
-
-        Args:
-            render_mode: The render mode to use. Options: "human", "rgb_array", or None.
-        """
+    def __init__(
+        self,
+        render_mode: Optional[str] = None,
+        max_episode_steps: int = KUKA_MAX_EPISODE_STEPS,
+    ):
         super().__init__()
 
         self.render_mode = render_mode
+        self.max_episode_steps = max_episode_steps
 
-        # Action space: torques for 3 joints (continuous)
-        # Each joint can apply torque in range [-1, 1]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(3,), dtype=np.float32)
-
-        # Observation space (3D): [q1, q1_dot, q2, q2_dot, q3, q3_dot,
-        #                          target_x, target_y, target_z, ee_x, ee_y, ee_z]
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(12,), dtype=np.float32
+        # Action space: 3 arm joint deltas + 1 gripper action.
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(KUKA_ACTION_DIM,),
+            dtype=np.float32,
         )
 
-        # Connect to PyBullet once (keep connection alive for all episodes)
+        # Observation: [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot,
+        #               target_xyz, ee_xyz] -> 16-D.
+        obs_dim = KUKA_ARM_JOINT_COUNT * 2 + 2 * 2 + 3 + 3
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+
+        # Connect to PyBullet once and keep the connection across episodes.
         if self.render_mode == "human":
             self.physics_client = p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)  # Disable GUI controls
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
         else:
             self.physics_client = p.connect(p.DIRECT)
 
-        # Set up physics engine parameters (these persist across resets)
-        p.setGravity(0, 0, -9.81)
-        p.setTimeStep(1.0 / 240.0)  # 240 Hz physics update rate
+        # Physics configuration.
+        p.setGravity(0, 0, -10.0)
+        p.setTimeStep(1.0 / 240.0)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-        # Initialize simulation objects (will be set in reset)
+        # Path to the truncated 3-DOF KUKA URDF with gripper.
+        # This URDF references meshes from pybullet_kuka/kuka_iiwa/meshes/
+        self._repo_root = os.path.dirname(os.path.abspath(__file__))
+        self._kuka_urdf_path = os.path.join(self._repo_root, "kuka_3dof.urdf")
+
+        # Add repo root to PyBullet search path so it can resolve mesh paths
+        p.setAdditionalSearchPath(self._repo_root)
+
+        # Simulation handles
+        self.plane_id = None
         self.robot_id = None
         self.target_id = None
-        self.plane_id = None
+
+        # Joint indices will be populated in _setup_pybullet_kuka.
+        self.arm_joint_indices = []
+        self.gripper_joint_indices = []
 
         # Episode tracking
         self.step_count = 0
         self.target_pos = None
         self.last_end_effector_pos = None
-        self.arm_joint_indices = [0, 1, 2]  # Will be set in _setup_pybullet
 
-    def _setup_pybullet(self):
-        """Load simulation assets (robot, target, plane) into PyBullet."""
+        # Number of physics substeps per Gym step for smoother motion.
+        self.sim_substeps_per_step = 4
+
+    def _setup_pybullet_kuka(self):
+        """
+        Load the plane and the truncated 3-DOF KUKA IIWA robot with gripper.
+        """
         # Load ground plane
         self.plane_id = p.loadURDF("plane.urdf")
 
-        # Define robot via URDF string (The reliable industry standard)
-        # This is much cleaner than createMultiBody for complex chains.
-        urdf_str = """
-        <?xml version="1.0"?>
-        <robot name="reacher">
-          <link name="base_link">
-            <!-- Visual-only: industrial pedestal base with accent top plate -->
-            <visual>
-              <geometry><box size="0.18 0.18 0.06"/></geometry>
-              <material name="base_dark"><color rgba="0.15 0.15 0.18 1"/></material>
-            </visual>
-            <visual>
-              <origin xyz="0 0 0.05"/>
-              <geometry><box size="0.12 0.12 0.02"/></geometry>
-              <material name="base_accent"><color rgba="0.85 0.85 0.88 1"/></material>
-            </visual>
-            <collision>
-              <!-- Collision kept as original 0.1 m cube to preserve physics -->
-              <geometry><box size="0.1 0.1 0.1"/></geometry>
-            </collision>
-            <inertial>
-              <mass value="0"/> <!-- 0 mass means fixed to world -->
-              <inertia ixx="0" ixy="0" ixz="0" iyy="0" iyz="0" izz="0"/>
-            </inertial>
-          </link>
-          
-          <joint name="joint1" type="revolute">
-            <parent link="base_link"/>
-            <child link="link1"/>
-            <origin xyz="0 0 0.05"/> <!-- At the top of the base box -->
-            <axis xyz="0 0 1"/>
-            <limit effort="10" velocity="10" lower="-3.14" upper="3.14"/>
-          </joint>
-          
-          <link name="link1">
-            <!-- Upper arm: oriented vertically so it starts perpendicular to the base -->
-            <visual>
-              <origin xyz="0 0 0.15"/> <!-- Center of 0.3m link along Z -->
-              <geometry><box size="0.05 0.05 0.3"/></geometry>
-              <material name="arm_upper"><color rgba="0.9 0.7 0.15 1"/></material>
-            </visual>
-            <!-- Base-side joint housing -->
-            <visual>
-              <origin xyz="0 0 0.0"/>
-              <geometry><cylinder length="0.055" radius="0.055"/></geometry>
-              <material name="joint_housing"><color rgba="0.3 0.3 0.35 1"/></material>
-            </visual>
-            <!-- Elbow-side joint flange -->
-            <visual>
-              <origin xyz="0 0 0.3"/>
-              <geometry><cylinder length="0.04" radius="0.045"/></geometry>
-              <material name="joint_flange"><color rgba="0.4 0.4 0.45 1"/></material>
-            </visual>
-            <collision>
-              <origin xyz="0 0 0.15"/>
-              <geometry><box size="0.05 0.05 0.3"/></geometry>
-            </collision>
-            <inertial>
-              <mass value="1"/>
-              <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
-            </inertial>
-          </link>
-          
-          <joint name="joint2" type="revolute">
-            <parent link="link1"/>
-            <child link="link2"/>
-            <origin xyz="0 0 0.3"/> <!-- At the top of vertical link1 -->
-            <axis xyz="0 1 0"/> <!-- Shoulder pitch -->
-            <limit effort="10" velocity="10" lower="-3.14" upper="3.14"/>
-          </joint>
-          
-          <link name="link2">
-            <!-- Visual-only: forearm with end-effector module -->
-            <visual>
-              <origin xyz="0.125 0 0"/> <!-- Center of 0.25m link along X -->
-              <geometry><box size="0.25 0.04 0.04"/></geometry>
-              <material name="arm_lower"><color rgba="0.95 0.8 0.2 1"/></material>
-            </visual>
-            <!-- Elbow joint housing -->
-            <visual>
-              <origin xyz="0 0 0.0"/>
-              <geometry><cylinder length="0.045" radius="0.045"/></geometry>
-              <material name="joint_housing"><color rgba="0.3 0.3 0.35 1"/></material>
-            </visual>
-            <!-- End-effector mounting plate -->
-            <visual>
-              <origin xyz="0.25 0 0"/>
-              <geometry><box size="0.04 0.06 0.02"/></geometry>
-              <material name="ee_plate"><color rgba="0.2 0.3 0.6 1"/></material>
-            </visual>
-            <!-- End-effector tip for screenshots (visual only, tiny) -->
-            <visual>
-              <origin xyz="0.27 0 0"/>
-              <geometry><sphere radius="0.025"/></geometry>
-              <material name="ee_tip"><color rgba="0.95 0.25 0.25 1"/></material>
-            </visual>
-            <collision>
-              <!-- Collision kept as original box to preserve dynamics -->
-              <origin xyz="0.125 0 0"/>
-              <geometry><box size="0.25 0.04 0.04"/></geometry>
-            </collision>
-            <inertial>
-              <mass value="1"/>
-              <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
-            </inertial>
-          </link>
+        # Load the truncated 3-DOF KUKA URDF with gripper.
+        if not os.path.exists(self._kuka_urdf_path):
+            raise FileNotFoundError(
+                f"KUKA URDF not found at {self._kuka_urdf_path}. "
+                "Make sure kuka_3dof.urdf is present in the repo root."
+            )
+        self.robot_id = p.loadURDF(self._kuka_urdf_path, basePosition=[0, 0, 0])
 
-          <joint name="joint3" type="revolute">
-            <parent link="link2"/>
-            <child link="link3"/>
-            <origin xyz="0.25 0 0"/> <!-- At the end of link2 -->
-            <axis xyz="0 1 0"/> <!-- Elbow pitch -->
-            <limit effort="10" velocity="10" lower="-3.14" upper="3.14"/>
-          </joint>
+        # Build joint index lists by querying joint names.
+        arm_joint_names = [
+            "lbr_iiwa_joint_1",
+            "lbr_iiwa_joint_2",
+            "lbr_iiwa_joint_3",
+        ]
+        gripper_joint_names = [
+            "left_finger_joint",
+            "right_finger_joint",
+        ]
 
-          <link name="link3">
-            <!-- Short wrist/end-effector stub -->
-            <visual>
-              <origin xyz="0.06 0 0"/>
-              <geometry><box size="0.12 0.03 0.03"/></geometry>
-              <material name="ee_body"><color rgba="0.85 0.85 0.9 1"/></material>
-            </visual>
-            <visual>
-              <origin xyz="0.12 0 0"/>
-              <geometry><sphere radius="0.02"/></geometry>
-              <material name="ee_tip"><color rgba="0.95 0.25 0.25 1"/></material>
-            </visual>
-            <collision>
-              <origin xyz="0.06 0 0"/>
-              <geometry><box size="0.12 0.03 0.03"/></geometry>
-            </collision>
-            <inertial>
-              <mass value="0.2"/>
-              <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
-            </inertial>
-          </link>
-        </robot>
-        """
-
-        # Write URDF to temporary file and load it
-        import tempfile
-        import os
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".urdf", delete=False) as f:
-            f.write(urdf_str)
-            urdf_path = f.name
-
-        self.robot_id = p.loadURDF(urdf_path, basePosition=[0, 0, 0])
-        os.unlink(urdf_path)
-
-        # In URDF, revolute joints are automatically indexed starting from 0
-        self.arm_joint_indices = [0, 1, 2]
-
-        # Verify joints
+        self.arm_joint_indices = []
+        self.gripper_joint_indices = []
         num_joints = p.getNumJoints(self.robot_id)
-        if num_joints < 3:
-            raise RuntimeError(f"Expected 3 joints but found {num_joints}")
+        joint_name_to_index = {}
+        for joint_index in range(num_joints):
+            joint_info = p.getJointInfo(self.robot_id, joint_index)
+            joint_name = joint_info[1].decode("utf-8")
+            joint_name_to_index[joint_name] = joint_index
 
-        # Disable default motors to enable torque control
+        for name in arm_joint_names:
+            if name not in joint_name_to_index:
+                raise KeyError(f"Expected arm joint {name} in KUKA URDF.")
+            self.arm_joint_indices.append(joint_name_to_index[name])
+
+        for name in gripper_joint_names:
+            if name not in joint_name_to_index:
+                raise KeyError(f"Expected gripper joint {name} in KUKA URDF.")
+            self.gripper_joint_indices.append(joint_name_to_index[name])
+
+        # Disable default motors to allow explicit position control.
+        all_actuated_joints = self.arm_joint_indices + self.gripper_joint_indices
         p.setJointMotorControlArray(
             self.robot_id,
-            self.arm_joint_indices,
+            all_actuated_joints,
             p.VELOCITY_CONTROL,
-            forces=[0, 0, 0],
+            forces=[0.0] * len(all_actuated_joints),
         )
 
-        # Create target sphere (keep collision radius, make visual slightly larger/brighter)
-        target_collision = p.createCollisionShape(p.GEOM_SPHERE, radius=0.05)
-        target_visual = p.createVisualShape(
-            p.GEOM_SPHERE, radius=0.06, rgbaColor=[0.15, 0.6, 0.95, 1.0]
-        )
-        self.target_id = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=target_collision,
-            baseVisualShapeIndex=target_visual,
-            basePosition=[0.5, 0, 0.3],
-        )
-
-        # Set a nicer default camera view for report-quality screenshots (GUI only)
+        # Camera focusing on the arm (GUI only).
         if self.render_mode == "human":
             p.resetDebugVisualizerCamera(
-                cameraDistance=1.4,
-                cameraYaw=45,
-                cameraPitch=-35,
-                cameraTargetPosition=[0.35, 0.0, 0.2],
+                cameraDistance=1.5,
+                cameraYaw=60,
+                cameraPitch=-30,
+                cameraTargetPosition=[0.0, 0.0, 0.4],
             )
+
+    def _get_observation(self) -> np.ndarray:
+        """
+        Construct the observation vector:
+        [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
+        """
+        # Arm joint states
+        arm_states = p.getJointStates(self.robot_id, self.arm_joint_indices)
+        arm_angles = np.array([s[0] for s in arm_states], dtype=np.float32)
+        arm_vels = np.array([s[1] for s in arm_states], dtype=np.float32)
+
+        # Gripper joint states
+        gripper_states = p.getJointStates(self.robot_id, self.gripper_joint_indices)
+        gripper_pos = np.array([s[0] for s in gripper_states], dtype=np.float32)
+        gripper_vels = np.array([s[1] for s in gripper_states], dtype=np.float32)
+
+        ee_pos = np.array(
+            p.getLinkState(
+                self.robot_id,
+                linkIndex=KUKA_EE_LINK_INDEX,
+                computeForwardKinematics=True,
+            )[0],
+            dtype=np.float32,
+        )
+        self.last_end_effector_pos = ee_pos
+
+        obs = np.concatenate(
+            [
+                arm_angles,
+                arm_vels,
+                gripper_pos,
+                gripper_vels,
+                self.target_pos.astype(np.float32),
+                ee_pos,
+            ]
+        ).astype(np.float32)
+        return obs
 
     def reset(
         self, seed: Optional[int] = None, options: Optional[dict] = None
     ) -> Tuple[np.ndarray, dict]:
         """
-        Reset the environment to an initial state.
-
-        Modern Gymnasium standard: Returns (observation, info).
-
-        Args:
-            seed: Optional random seed for reproducibility
-            options: Optional dictionary with additional reset options
-
-        Returns:
-            observation: Initial observation of the environment
-            info: Dictionary with additional information
+        Reset the truncated 3-DOF KUKA with gripper reaching environment.
         """
         super().reset(seed=seed)
 
-        # Reset simulation without disconnecting (keeps GUI window open)
-        # This is much faster and more stable than disconnecting/reconnecting
+        # Clear simulation but keep connection.
         p.resetSimulation()
 
-        # Restore physics settings (resetSimulation clears them)
-        p.setGravity(0, 0, -9.81)
+        # Reapply physics settings.
+        p.setGravity(0, 0, -10.0)
         p.setTimeStep(1.0 / 240.0)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-        # Reload simulation assets
-        self._setup_pybullet()
+        # Reload assets.
+        self._setup_pybullet_kuka()
 
-        # Reset robot arm joints.
-        # Start upright (link1 is vertical in the URDF) and add a small random perturbation.
-        joint_positions = self.np_random.uniform(
-            low=-0.15 * np.pi, high=0.15 * np.pi, size=(3,)
+        # Initialize arm joints near zero with small random noise.
+        arm_positions = self.np_random.uniform(
+            low=-0.15 * np.pi, high=0.15 * np.pi, size=(KUKA_ARM_JOINT_COUNT,)
         )
         for idx, joint_idx in enumerate(self.arm_joint_indices):
-            p.resetJointState(self.robot_id, joint_idx, joint_positions[idx], 0.0)
+            p.resetJointState(self.robot_id, joint_idx, float(arm_positions[idx]), 0.0)
 
-        # Randomize target position in 3D within a reachable shell.
-        # Keep it above the ground plane for better visuals and fewer collisions.
-        azimuth = self.np_random.uniform(0, 2 * np.pi)
-        elevation = self.np_random.uniform(-0.35 * np.pi, 0.25 * np.pi)
-        radius = self.np_random.uniform(0.25, 0.55)
-        x = radius * np.cos(elevation) * np.cos(azimuth)
-        y = radius * np.cos(elevation) * np.sin(azimuth)
-        z = max(0.08, radius * np.sin(elevation) + 0.25)
+        # Initialize gripper in open position (left: 0, right: 0).
+        for joint_idx in self.gripper_joint_indices:
+            p.resetJointState(self.robot_id, joint_idx, 0.0, 0.0)
+
+        # Randomize target position in front of the base within the reachable workspace.
+        x = self.np_random.uniform(0.2, 0.6)
+        y = self.np_random.uniform(-0.3, 0.3)
+        z = self.np_random.uniform(0.3, 0.7)
         self.target_pos = np.array([x, y, z], dtype=np.float32)
-        p.resetBasePositionAndOrientation(
-            self.target_id, self.target_pos.tolist(), [0, 0, 0, 1]
+
+        # Create a simple spherical target.
+        target_collision = p.createCollisionShape(p.GEOM_SPHERE, radius=0.04)
+        target_visual = p.createVisualShape(
+            p.GEOM_SPHERE, radius=0.05, rgbaColor=[0.15, 0.6, 0.95, 1.0]
+        )
+        self.target_id = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=target_collision,
+            baseVisualShapeIndex=target_visual,
+            basePosition=self.target_pos.tolist(),
         )
 
-        # Reset episode counter
         self.step_count = 0
 
-        # Get initial observation
         observation = self._get_observation()
-
         info = {"target_position": self.target_pos.copy()}
-
         return observation, info
 
-    def _get_observation(self) -> np.ndarray:
-        """Compute the current observation vector."""
-        # Get joint states for revolute arm joints
-        joint_states = p.getJointStates(self.robot_id, self.arm_joint_indices)
-        joint_angles = [state[0] for state in joint_states]
-        joint_velocities = [state[1] for state in joint_states]
+    def _apply_action(self, action: np.ndarray):
+        """
+        Map the 4-D action into target joint positions.
 
-        # End-effector position from PyBullet forward kinematics (world frame).
-        # The end-effector is the final link attached to joint3.
-        end_effector_world_pos = np.array(
-            p.getLinkState(self.robot_id, linkIndex=2, computeForwardKinematics=True)[
-                0
-            ],
-            dtype=np.float32,
-        )
-        self.last_end_effector_pos = end_effector_world_pos
+        - First 3 elements: arm joint position deltas
+        - 4th element: gripper action (positive = open, negative = close)
+        """
+        action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Construct observation (3D):
-        # [q1, q1_dot, q2, q2_dot, q3, q3_dot, target_xyz, ee_xyz]
-        observation = np.array(
-            [
-                joint_angles[0],
-                joint_velocities[0],
-                joint_angles[1],
-                joint_velocities[1],
-                joint_angles[2],
-                joint_velocities[2],
-                self.target_pos[0],
-                self.target_pos[1],
-                self.target_pos[2],
-                end_effector_world_pos[0],
-                end_effector_world_pos[1],
-                end_effector_world_pos[2],
-            ],
-            dtype=np.float32,
+        # Arm joint control: apply deltas to current positions.
+        arm_deltas = action[:KUKA_ARM_JOINT_COUNT] * KUKA_JOINT_DELTA_SCALE
+
+        arm_states = p.getJointStates(self.robot_id, self.arm_joint_indices)
+        arm_angles = np.array([s[0] for s in arm_states], dtype=np.float32)
+
+        target_arm_angles = arm_angles + arm_deltas
+        target_arm_angles = np.clip(target_arm_angles, -np.pi, np.pi)
+
+        p.setJointMotorControlArray(
+            self.robot_id,
+            self.arm_joint_indices,
+            p.POSITION_CONTROL,
+            targetPositions=target_arm_angles.tolist(),
+            forces=[300.0] * len(self.arm_joint_indices),
         )
 
-        return observation
+        # Gripper control: 4th action controls opening/closing.
+        # Positive action = open (fingers move apart), negative = close.
+        gripper_action = action[3] * KUKA_GRIPPER_DELTA_SCALE
+
+        gripper_states = p.getJointStates(self.robot_id, self.gripper_joint_indices)
+        gripper_pos = np.array([s[0] for s in gripper_states], dtype=np.float32)
+
+        # Left finger moves in negative x direction (limit: -0.055 to 0)
+        # Right finger moves in positive x direction (limit: 0 to 0.055)
+        # Opening = left goes more negative, right goes more positive
+        target_left = np.clip(gripper_pos[0] - gripper_action, -0.055, 0.0)
+        target_right = np.clip(gripper_pos[1] + gripper_action, 0.0, 0.055)
+
+        p.setJointMotorControlArray(
+            self.robot_id,
+            self.gripper_joint_indices,
+            p.POSITION_CONTROL,
+            targetPositions=[target_left, target_right],
+            forces=[80.0, 80.0],
+        )
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
-        Run one timestep of the environment's dynamics.
-
-        Modern Gymnasium standard: Returns 5 values.
-        (observation, reward, terminated, truncated, info)
-
-        Args:
-            action: The action to take (torques for 3 joints)
-
-        Returns:
-            observation: Observation of the environment after the step
-            reward: Reward for this step
-            terminated: Whether the episode ended due to task completion
-            truncated: Whether the episode ended due to time limit
-            info: Dictionary with additional information
+        Run one timestep of the truncated 3-DOF KUKA with gripper reaching environment.
         """
-        # Clip action to valid range
-        action = np.clip(action, self.action_space.low, self.action_space.high)
+        self._apply_action(action)
 
-        # Apply torques to arm joints (indices 1 and 2)
-        p.setJointMotorControlArray(
-            self.robot_id,
-            self.arm_joint_indices,  # Use arm joint indices, not 0 and 1
-            p.TORQUE_CONTROL,
-            forces=action * 2.0,  # Scale action to reasonable torque values
-        )
+        # Integrate physics for smoother motion.
+        for _ in range(self.sim_substeps_per_step):
+            p.stepSimulation()
 
-        # Step simulation
-        p.stepSimulation()
-
-        # Increment step counter
         self.step_count += 1
 
-        # Get new observation
         observation = self._get_observation()
 
-        # Calculate reward: negative 3D distance to target
+        # Distance-based reward.
         distance_to_target = float(
             np.linalg.norm(self.last_end_effector_pos - self.target_pos)
         )
         reward = -distance_to_target
 
-        # Bonus for reaching target (within 5cm)
+        # Success bonus when close enough.
         if distance_to_target < 0.05:
             reward += 10.0
             terminated = True
         else:
             terminated = False
 
-        # Episode truncation: time limit reached
-        truncated = self.step_count >= MAX_EPISODE_STEPS
+        truncated = self.step_count >= self.max_episode_steps
 
         info = {
             "distance_to_target": distance_to_target,
             "step_count": self.step_count,
+            "target_position": self.target_pos.copy(),
+            "end_effector_position": self.last_end_effector_pos.copy(),
         }
 
         return observation, reward, terminated, truncated, info
@@ -439,37 +362,34 @@ class PyBulletReacherEnv(gym.Env):
     def render(self):
         """Render the environment (handled automatically by PyBullet GUI)."""
         if self.render_mode == "human":
-            # PyBullet GUI handles rendering automatically
-            time.sleep(1.0 / TARGET_FPS)  # Control playback speed
+            time.sleep(1.0 / TARGET_FPS)
         elif self.render_mode == "rgb_array":
-            # Could implement camera-based rendering here if needed
+            # Could implement camera-based rendering here if needed.
             pass
 
     def close(self):
         """Clean up and close the environment."""
-        if self.physics_client is not None:
+        if getattr(self, "physics_client", None) is not None:
             p.disconnect(self.physics_client)
             self.physics_client = None
 
 
 def main():
     """
-    Main function that demonstrates the modern PyBullet + Gymnasium environment.
+    Main function for the truncated 3-DOF KUKA IIWA with gripper reaching environment.
 
-    The robot arm will perform random actions to demonstrate that the physics
+    The KUKA robot will perform random actions to demonstrate that the physics
     simulation is working correctly.
     """
     print("=" * 60)
-    print("Modern PyBullet + Gymnasium Robot Simulation")
+    print("Truncated 3-DOF KUKA IIWA with Gripper - Reaching Task")
     print("=" * 60)
-    print("\nThis script uses:")
+    print("\nThis demo uses:")
     print("  ✓ Gymnasium (modern RL API)")
     print("  ✓ PyBullet (direct physics engine)")
-    print("  ✓ Custom Gymnasium environment (no legacy dependencies)")
+    print("  ✓ Truncated KUKA IIWA mesh geometry (3 arm joints + gripper)")
     print("\n" + "=" * 60 + "\n")
 
-    # Create the environment, choosing render mode based on environment variables.
-    # Default is "human" (GUI) locally; in headless/docker we can set PYBULLET_RENDER_MODE.
     render_mode_env = os.environ.get("PYBULLET_RENDER_MODE", "human")
     if render_mode_env is not None and render_mode_env.lower() in (
         "none",
@@ -480,35 +400,36 @@ def main():
     else:
         resolved_render_mode = render_mode_env
 
-    print(f"Creating PyBulletReacherEnv with render_mode={resolved_render_mode!r}...")
+    print(f"Creating KukaPickPlaceEnv with render_mode={resolved_render_mode!r}...")
     try:
-        env = PyBulletReacherEnv(render_mode=resolved_render_mode)
+        env = KukaPickPlaceEnv(render_mode=resolved_render_mode)
     except Exception as e:
-        print(f"Error creating environment: {e}")
+        print(f"Error creating KukaPickPlaceEnv: {e}")
         print("\nTroubleshooting:")
         print("  1. Install PyBullet: pip install pybullet")
         print("  2. Install Gymnasium: pip install gymnasium")
-        print("  3. For headless servers: use render_mode=None or xvfb")
+        print(
+            "  3. Ensure kuka_3dof.urdf and pybullet_kuka assets are present in the repo."
+        )
         return
 
-    print("Environment created successfully!")
+    print("KukaPickPlaceEnv created successfully!")
     print("\nInitializing environment...")
 
-    # Reset the environment (modern Gymnasium: returns obs, info)
     try:
         observation, info = env.reset(seed=42)
         print(f"Environment reset. Observation shape: {observation.shape}")
         print(f"Target position: {info['target_position']}")
     except Exception as e:
-        print(f"Error resetting environment: {e}")
+        print(f"Error resetting KukaPickPlaceEnv: {e}")
         env.close()
         return
 
     print("\n" + "=" * 60)
-    print("Simulation Started!")
+    print("Truncated 3-DOF KUKA with Gripper - Simulation Started!")
     print("=" * 60)
-    print("The robot arm will perform random movements.")
-    print("Watch the PyBullet window to see the robot in action.")
+    print("The 3-DOF KUKA arm with gripper will perform random reaching.")
+    print("Watch the PyBullet window to see the real KUKA geometry and gripper.")
     print("\nPress Ctrl+C to stop the simulation.")
     print("=" * 60 + "\n")
 
@@ -516,39 +437,31 @@ def main():
 
     try:
         for step in range(SIMULATION_STEPS):
-            # Sample a random action from the action space
             action = env.action_space.sample()
-
-            # Step the environment (modern Gymnasium: returns 5 values)
             observation, reward, terminated, truncated, info = env.step(action)
 
-            # Render (controls playback speed)
             env.render()
 
-            # Handle episode termination
             if terminated or truncated:
                 episode_count += 1
                 reason = "Target reached!" if terminated else "Time limit"
                 print(
-                    f"Episode {episode_count} finished (step {step}): {reason} "
-                    f"(distance: {info['distance_to_target']:.3f})"
+                    f"KUKA Episode {episode_count} finished (step {step}): {reason} "
+                    f"(distance_to_target: {info['distance_to_target']:.3f})"
                 )
                 observation, info = env.reset()
 
     except KeyboardInterrupt:
-        print("\n\nSimulation interrupted by user (Ctrl+C).")
-
+        print("\n\nKUKA simulation interrupted by user (Ctrl+C).")
     except Exception as e:
-        print(f"\nUnexpected error during simulation: {e}")
+        print(f"\nUnexpected error during KUKA simulation: {e}")
         import traceback
 
         traceback.print_exc()
-
     finally:
-        # Clean up (always executed)
-        print("\nClosing environment and cleaning up resources...")
+        print("\nClosing KukaPickPlaceEnv and cleaning up resources...")
         env.close()
-        print("Environment closed successfully. Goodbye!")
+        print("KukaPickPlaceEnv closed successfully. Goodbye!")
 
 
 if __name__ == "__main__":

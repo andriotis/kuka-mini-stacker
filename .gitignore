@@ -33,3 +33,4 @@ dist/
 # Docker / runtime
 *.pid
 
+pybullet_kuka/
