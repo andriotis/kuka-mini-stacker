@@ -1,5 +1,5 @@
 """
-env_test.py - Truncated 3-DOF KUKA IIWA with gripper reaching environment.
+env_test.py - Truncated 4-DOF KUKA IIWA with gripper reaching environment.
 
 MODERN DEEP RL STACK (2025):
 This script demonstrates a fully modern implementation using:
@@ -12,7 +12,7 @@ NO LEGACY DEPENDENCIES:
 - No 'pybullet_envs' package (legacy, incompatible with modern Gymnasium)
 - Pure Gymnasium API with direct PyBullet integration
 
-The robot uses a truncated 3-DOF KUKA IIWA arm with a prismatic gripper.
+The robot uses a truncated 4-DOF KUKA IIWA arm with a prismatic gripper.
 The URDF file (kuka_3dof.urdf) references meshes from pybullet_kuka/kuka_iiwa/meshes/.
 """
 
@@ -31,29 +31,29 @@ TARGET_FPS = 60.0  # Target frames per second for visual playback
 SIMULATION_STEPS = 1000  # Number of simulation steps to run
 MAX_EPISODE_STEPS = 150  # Maximum steps per episode
 
-# KUKA-specific constants for the truncated 3-DOF KUKA + gripper reaching environment
-KUKA_ARM_JOINT_COUNT = 3  # Truncated KUKA arm has 3 revolute joints
-KUKA_ACTION_DIM = 4  # 3 arm joint deltas + 1 gripper action
+# KUKA-specific constants for the truncated 4-DOF KUKA + gripper reaching environment
+KUKA_ARM_JOINT_COUNT = 4  # Truncated KUKA arm has 4 revolute joints
+KUKA_ACTION_DIM = 5  # 4 arm joint deltas + 1 gripper action
 KUKA_MAX_EPISODE_STEPS = 200
-KUKA_EE_LINK_INDEX = 3  # Link index for gripper_body (end-effector)
+KUKA_EE_LINK_INDEX = 5  # Link index for body (end-effector) - link_0=base, joints 1-4, gripper_base fixed, body=5
 KUKA_JOINT_DELTA_SCALE = 0.05  # Radians per step for arm joints
 KUKA_GRIPPER_DELTA_SCALE = 0.01  # Meters per step for gripper
 
 
 class KukaPickPlaceEnv(gym.Env):
     """
-    Truncated 3-DOF KUKA IIWA with gripper - reaching environment.
+    Truncated 4-DOF KUKA IIWA with gripper - reaching environment.
 
-    This environment loads a truncated KUKA IIWA URDF (3 arm joints + prismatic
+    This environment loads a truncated KUKA IIWA URDF (4 arm joints + prismatic
     gripper) with authentic KUKA mesh visuals. The task is reaching: move the
     gripper to a target position.
 
-    Action space is 4-D:
-    - First 3 components: arm joint position deltas
-    - 4th component: gripper open/close (positive = open, negative = close)
+    Action space is 5-D:
+    - First 4 components: arm joint position deltas
+    - 5th component: gripper open/close (positive = open, negative = close)
 
-    Observation space is 16-D:
-    [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
+    Observation space is 18-D:
+    [4 arm_q, 4 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
@@ -68,7 +68,7 @@ class KukaPickPlaceEnv(gym.Env):
         self.render_mode = render_mode
         self.max_episode_steps = max_episode_steps
 
-        # Action space: 3 arm joint deltas + 1 gripper action.
+        # Action space: 4 arm joint deltas + 1 gripper action.
         self.action_space = spaces.Box(
             low=-1.0,
             high=1.0,
@@ -76,8 +76,8 @@ class KukaPickPlaceEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Observation: [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot,
-        #               target_xyz, ee_xyz] -> 16-D.
+        # Observation: [4 arm_q, 4 arm_qdot, 2 gripper_q, 2 gripper_qdot,
+        #               target_xyz, ee_xyz] -> 18-D.
         obs_dim = KUKA_ARM_JOINT_COUNT * 2 + 2 * 2 + 3 + 3
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
@@ -95,7 +95,7 @@ class KukaPickPlaceEnv(gym.Env):
         p.setTimeStep(1.0 / 240.0)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
-        # Path to the truncated 3-DOF KUKA URDF with gripper.
+        # Path to the truncated 4-DOF KUKA URDF with gripper.
         # This URDF references meshes from pybullet_kuka/kuka_iiwa/meshes/
         self._repo_root = os.path.dirname(os.path.abspath(__file__))
         self._kuka_urdf_path = os.path.join(self._repo_root, "kuka_3dof.urdf")
@@ -122,12 +122,12 @@ class KukaPickPlaceEnv(gym.Env):
 
     def _setup_pybullet_kuka(self):
         """
-        Load the plane and the truncated 3-DOF KUKA IIWA robot with gripper.
+        Load the plane and the truncated 4-DOF KUKA IIWA robot with gripper.
         """
         # Load ground plane
         self.plane_id = p.loadURDF("plane.urdf")
 
-        # Load the truncated 3-DOF KUKA URDF with gripper.
+        # Load the truncated 4-DOF KUKA URDF with gripper.
         if not os.path.exists(self._kuka_urdf_path):
             raise FileNotFoundError(
                 f"KUKA URDF not found at {self._kuka_urdf_path}. "
@@ -140,10 +140,11 @@ class KukaPickPlaceEnv(gym.Env):
             "lbr_iiwa_joint_1",
             "lbr_iiwa_joint_2",
             "lbr_iiwa_joint_3",
+            "lbr_iiwa_joint_4",
         ]
         gripper_joint_names = [
-            "left_finger_joint",
-            "right_finger_joint",
+            "left_finger_sliding_joint",
+            "right_finger_sliding_joint",
         ]
 
         self.arm_joint_indices = []
@@ -186,7 +187,7 @@ class KukaPickPlaceEnv(gym.Env):
     def _get_observation(self) -> np.ndarray:
         """
         Construct the observation vector:
-        [3 arm_q, 3 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
+        [4 arm_q, 4 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
         """
         # Arm joint states
         arm_states = p.getJointStates(self.robot_id, self.arm_joint_indices)
@@ -224,7 +225,7 @@ class KukaPickPlaceEnv(gym.Env):
         self, seed: Optional[int] = None, options: Optional[dict] = None
     ) -> Tuple[np.ndarray, dict]:
         """
-        Reset the truncated 3-DOF KUKA with gripper reaching environment.
+        Reset the truncated 4-DOF KUKA with gripper reaching environment.
         """
         super().reset(seed=seed)
 
@@ -276,10 +277,10 @@ class KukaPickPlaceEnv(gym.Env):
 
     def _apply_action(self, action: np.ndarray):
         """
-        Map the 4-D action into target joint positions.
+        Map the 5-D action into target joint positions.
 
-        - First 3 elements: arm joint position deltas
-        - 4th element: gripper action (positive = open, negative = close)
+        - First 4 elements: arm joint position deltas
+        - 5th element: gripper action (positive = open, negative = close)
         """
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
@@ -300,9 +301,9 @@ class KukaPickPlaceEnv(gym.Env):
             forces=[300.0] * len(self.arm_joint_indices),
         )
 
-        # Gripper control: 4th action controls opening/closing.
+        # Gripper control: 5th action controls opening/closing.
         # Positive action = open (fingers move apart), negative = close.
-        gripper_action = action[3] * KUKA_GRIPPER_DELTA_SCALE
+        gripper_action = action[4] * KUKA_GRIPPER_DELTA_SCALE
 
         gripper_states = p.getJointStates(self.robot_id, self.gripper_joint_indices)
         gripper_pos = np.array([s[0] for s in gripper_states], dtype=np.float32)
@@ -323,7 +324,7 @@ class KukaPickPlaceEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """
-        Run one timestep of the truncated 3-DOF KUKA with gripper reaching environment.
+        Run one timestep of the truncated 4-DOF KUKA with gripper reaching environment.
         """
         self._apply_action(action)
 
@@ -376,18 +377,18 @@ class KukaPickPlaceEnv(gym.Env):
 
 def main():
     """
-    Main function for the truncated 3-DOF KUKA IIWA with gripper reaching environment.
+    Main function for the truncated 4-DOF KUKA IIWA with gripper reaching environment.
 
     The KUKA robot will perform random actions to demonstrate that the physics
     simulation is working correctly.
     """
     print("=" * 60)
-    print("Truncated 3-DOF KUKA IIWA with Gripper - Reaching Task")
+    print("Truncated 4-DOF KUKA IIWA with Gripper - Reaching Task")
     print("=" * 60)
     print("\nThis demo uses:")
     print("  ✓ Gymnasium (modern RL API)")
     print("  ✓ PyBullet (direct physics engine)")
-    print("  ✓ Truncated KUKA IIWA mesh geometry (3 arm joints + gripper)")
+    print("  ✓ Truncated KUKA IIWA mesh geometry (4 arm joints + gripper)")
     print("\n" + "=" * 60 + "\n")
 
     render_mode_env = os.environ.get("PYBULLET_RENDER_MODE", "human")
@@ -426,9 +427,9 @@ def main():
         return
 
     print("\n" + "=" * 60)
-    print("Truncated 3-DOF KUKA with Gripper - Simulation Started!")
+    print("Truncated 4-DOF KUKA with Gripper - Simulation Started!")
     print("=" * 60)
-    print("The 3-DOF KUKA arm with gripper will perform random reaching.")
+    print("The 4-DOF KUKA arm with gripper will perform random reaching.")
     print("Watch the PyBullet window to see the real KUKA geometry and gripper.")
     print("\nPress Ctrl+C to stop the simulation.")
     print("=" * 60 + "\n")
