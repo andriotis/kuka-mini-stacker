@@ -1,114 +1,238 @@
-## KUKA Mini Stacker – Modern PyBullet + Gymnasium Demo
+# KUKA Mini Stacker
 
-This repository contains a **modern reinforcement learning–ready robot arm simulation** built with **PyBullet** and **Gymnasium**.  
-It implements a custom `PyBulletReacherEnv` where a 3-DOF arm reaches randomly placed 3D targets, designed as a clean, up-to-date example of how to:
+A modern reinforcement learning environment for robot arm control using PyBullet and Gymnasium.
 
-- **Integrate PyBullet directly** (no legacy `pybullet_envs`)
-- **Use the Gymnasium API** (no deprecated `gym` dependency)
-- **Package a simulation for local and Docker/headless usage**
+![KUKA Reaching Demo](demo.gif)
 
-### Project Status
+## Overview
 
-- **Maturity**: Prototype / demo
-- **Core environment**: Implemented and working (random policy rollout)
-- **RL training code**: **Not yet included** (environment is RL-ready)
-- **Headless support**: Docker image runs PyBullet in DIRECT/headless mode via `PYBULLET_RENDER_MODE=headless`
+This repository implements a **4-DOF KUKA IIWA robot arm with gripper** in a reaching task environment, featuring:
 
-### Features
+- **Modern RL Stack**: Gymnasium API (no deprecated `gym`) + PyBullet physics (no legacy `pybullet_envs`)
+- **Multiple Training Methods**: Pure PPO, behavioral cloning (BC) pretraining, or BC + PPO hybrid
+- **IK Teacher Policy**: Inverse kinematics-based expert for demonstration collection
+- **Docker Support**: Fully containerized with headless rendering for cloud/CI training
+- **Comprehensive Logging**: TensorBoard, Weights & Biases, video recording, checkpointing
 
-- **Custom Gymnasium environment** (`PyBulletReacherEnv`) wrapping a PyBullet simulation
-- **3-joint robot arm** defined via an inline URDF with visually clean geometry
-- **Random 3D target placement** within a reachable workspace
-- **Shaped reward** based on distance to the target, with a success bonus
-- **Modern Gymnasium API**: `(obs, info)` on reset and 5-tuple return from `step`
-- **Dockerfile** for reproducible, headless runs using `uv` for dependency installation
+## Project Status
 
----
+| Component | Status |
+|-----------|--------|
+| Environment (`KukaPickPlaceEnv`) | Complete |
+| PPO Training | Complete |
+| IK Teacher Policy | Complete |
+| Behavioral Cloning | Complete |
+| BC + PPO Pipeline | Complete |
+| Docker Support | Complete |
+| Sanity Checks | Complete |
 
-### Getting Started (Local)
+## Quick Start
 
-1. **Create and activate a virtualenv** (recommended):
+### Local Installation
 
 ```bash
+# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate
-```
 
-2. **Install dependencies**:
-
-```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-3. **Run the simulation** (GUI by default, if available):
-
-```bash
+# Run the simulation (GUI mode)
 python env_test.py
+
+# Run headless
+PYBULLET_RENDER_MODE=headless python env_test.py
 ```
 
-If you are on a headless machine or want to disable the GUI, set:
+### Docker
 
 ```bash
-export PYBULLET_RENDER_MODE=headless
-python env_test.py
-```
-
----
-
-### Running with Docker
-
-Build the image:
-
-```bash
+# Build the image
 docker build -t kuka-mini-stacker .
-```
 
-Run the container (headless by default via `PYBULLET_RENDER_MODE=headless`):
+# Run sanity check
+docker run --rm kuka-mini-stacker python sanity_check.py
 
-```bash
+# Run the simulation
 docker run --rm kuka-mini-stacker
+
+# Train with PPO
+docker run --rm -v $(pwd)/logs:/app/logs kuka-mini-stacker python train_ppo.py --timesteps 100000
 ```
 
-If you want to experiment with other render modes, override the env variable:
+## Environment
+
+The `KukaPickPlaceEnv` is a Gymnasium-compatible environment featuring:
+
+- **Robot**: Truncated 4-DOF KUKA IIWA arm with prismatic gripper
+- **Task**: Reach a randomly placed target on a table
+- **Observation** (27-D): `[sin(q), cos(q), qdot, grip_pos, grip_vel, relative_target, ee_pos, prev_action]`
+- **Action** (5-D): `[4 arm joint deltas, 1 gripper action]`
+- **Reward**: Distance-based shaping with progress bonus and success reward (+50 at distance < 0.05)
+
+```python
+from env_test import KukaPickPlaceEnv
+
+env = KukaPickPlaceEnv(render_mode="human")  # or "rgb_array" or None
+obs, info = env.reset(seed=42)
+
+for _ in range(1000):
+    action = env.action_space.sample()
+    obs, reward, terminated, truncated, info = env.step(action)
+    if terminated or truncated:
+        obs, info = env.reset()
+
+env.close()
+```
+
+## Training
+
+### Option 1: Pure PPO
+
+Train a PPO agent from scratch:
 
 ```bash
-docker run --rm -e PYBULLET_RENDER_MODE=none kuka-mini-stacker
+python train_ppo.py --timesteps 500000 --n-envs 4
+
+# With video recording and W&B logging
+python train_ppo.py --timesteps 500000 --record-video --wandb
 ```
 
-> Note: For full GUI rendering from inside Docker, additional host/Display/X11 configuration would be required and is not set up by default.
+### Option 2: Behavioral Cloning + PPO (Recommended)
 
----
+Use the IK teacher to bootstrap learning:
 
-### Code Layout
-
-- `env_test.py` – Main script containing:
-  - `PyBulletReacherEnv`: Gymnasium-compatible environment for the 3-DOF arm
-  - `main()`: Demo loop that samples random actions and runs the simulation
-- `requirements.txt` – Minimal set of Python dependencies (Gymnasium, PyBullet, NumPy)
-- `Dockerfile` – Container image definition using Python 3.11 and `uv` for installing dependencies
-
----
-
-### Screenshots
-
-_Placeholders for future screenshots of the simulation:_
-
-- **Screenshot 1**: Arm in default pose with target sphere visible.
-- **Screenshot 2**: Arm successfully reaching a nearby target.
-- **Screenshot 3**: Example of multiple targets over different episodes (collage).
-
-Once you capture images, you can embed them here, for example:
-
-```markdown
-![KUKA Mini Stacker – Initial Pose](docs/images/initial_pose.png)
-![KUKA Mini Stacker – Reaching Target](docs/images/reach_target.png)
+```bash
+# Collect demonstrations, pretrain with BC, then fine-tune with PPO
+python train_with_bc.py --collect-demos 100 --bc-epochs 50 --timesteps 200000
 ```
 
----
+### Option 3: Step-by-Step Pipeline
 
-### Next Steps / Ideas
+```bash
+# 1. Collect expert demonstrations
+python collect_demos.py --episodes 100 --output demos/teacher_demos.npz
 
-- Add **training scripts** with a modern RL library (e.g., Stable-Baselines3, CleanRL, or custom PPO/SAC) to learn a policy on `PyBulletReacherEnv`.
-- Extend the environment with **obstacles**, **different reward structures**, or **partial observability**.
-- Integrate **logging and video recording** for automated experiment tracking.
+# 2. Pretrain policy with behavioral cloning
+python bc_pretrain.py --demos demos/teacher_demos.npz --epochs 50
 
+# 3. Fine-tune with PPO
+python train_with_bc.py --demos demos/teacher_demos.npz --bc-epochs 0 --timesteps 200000
+```
+
+## Scripts Reference
+
+| Script | Description |
+|--------|-------------|
+| `env_test.py` | Environment implementation and demo |
+| `train_ppo.py` | Baseline PPO training script |
+| `ik_teacher.py` | IK-based expert policy |
+| `collect_demos.py` | Collect demonstrations using IK teacher |
+| `bc_pretrain.py` | Behavioral cloning pretraining module |
+| `train_with_bc.py` | Full BC + PPO training pipeline |
+| `sanity_check.py` | Verify environment setup (useful for Docker) |
+
+## Configuration
+
+### PPO Hyperparameters
+
+```bash
+python train_ppo.py \
+    --timesteps 500000 \
+    --n-envs 4 \
+    --lr 3e-4 \
+    --n-steps 2048 \
+    --batch-size 64 \
+    --n-epochs 5 \
+    --gamma 0.99 \
+    --gae-lambda 0.95 \
+    --clip-range 0.2 \
+    --ent-coef 0.01 \
+    --normalize-reward
+```
+
+### Behavioral Cloning
+
+```bash
+python train_with_bc.py \
+    --collect-demos 200 \
+    --teacher-gain 1.0 \
+    --bc-epochs 100 \
+    --bc-batch-size 64 \
+    --bc-lr 1e-3
+```
+
+## Logging & Monitoring
+
+Training logs are saved to `./logs/` with the following structure:
+
+```
+logs/
+└── ppo_kuka_20260121_143000/
+    ├── tensorboard/      # TensorBoard logs
+    ├── checkpoints/      # Model checkpoints
+    ├── videos/           # Training videos (if enabled)
+    ├── eval/             # Evaluation results and best model
+    └── bc/               # BC pretraining artifacts (if used)
+```
+
+View training progress with TensorBoard:
+
+```bash
+tensorboard --logdir logs/
+```
+
+## Docker Sanity Check
+
+The sanity check verifies all components work correctly:
+
+```bash
+# Quick check (essential tests only)
+docker run --rm kuka-mini-stacker python sanity_check.py --quick
+
+# Full check (includes training test)
+docker run --rm kuka-mini-stacker python sanity_check.py
+```
+
+Checks performed:
+- Python version and dependencies
+- URDF and mesh assets
+- PyBullet headless connection
+- Environment creation, reset, and step
+- RGB rendering
+- SB3 model creation and training
+- Model save/load
+
+## File Structure
+
+```
+kuka-mini-stacker/
+├── env_test.py          # KukaPickPlaceEnv implementation
+├── train_ppo.py         # PPO training script
+├── ik_teacher.py        # IK teacher policy
+├── collect_demos.py     # Demonstration collection
+├── bc_pretrain.py       # Behavioral cloning module
+├── train_with_bc.py     # BC + PPO pipeline
+├── sanity_check.py      # Docker/environment validation
+├── kuka_3dof.urdf       # Robot URDF definition
+├── pybullet_kuka/       # KUKA mesh assets
+├── requirements.txt     # Python dependencies
+├── Dockerfile           # Container definition
+└── logs/                # Training outputs
+```
+
+## Requirements
+
+- Python >= 3.9
+- gymnasium >= 1.2.0
+- pybullet >= 3.2.5
+- stable-baselines3 >= 2.3.0
+- torch >= 2.0.0
+- numpy >= 2.0.0
+
+See `requirements.txt` for complete list.
+
+## License
+
+KUKA IIWA URDF and meshes are adapted from the RCPRG-ros-pkg/lwr_robot project, licensed under BSD-2-Clause.

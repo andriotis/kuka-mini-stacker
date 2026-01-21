@@ -1,3 +1,19 @@
 gymnasium>=1.2.0,<2.0.0
 pybullet>=3.2.5,<4.0.0
 numpy>=2.0.0,<3.0.0
+
+# RL Training
+stable-baselines3>=2.3.0,<3.0.0
+torch>=2.0.0  # Required for BC pretraining (also a dependency of SB3)
+
+# Logging & Monitoring
+tensorboard>=2.15.0
+wandb>=0.16.0
+
+# Video Recording
+moviepy>=1.0.3
+imageio>=2.30.0
+
+# Progress bar (optional but recommended)
+tqdm>=4.64.0
+rich>=13.0.0

@@ -39,6 +39,11 @@ KUKA_EE_LINK_INDEX = 5  # Link index for body (end-effector) - link_0=base, join
 KUKA_JOINT_DELTA_SCALE = 0.05  # Radians per step for arm joints
 KUKA_GRIPPER_DELTA_SCALE = 0.01  # Meters per step for gripper
 
+# Table configuration
+TABLE_POSITION = [0.5, 0.0, 0.0]  # In front of the robot base
+TABLE_HALF_EXTENTS = [0.3, 0.4, 0.3]  # Half-size: 0.6m x 0.8m x 0.6m tall
+TABLE_HEIGHT = TABLE_HALF_EXTENTS[2] * 2  # Full height = 0.6m
+
 
 class KukaPickPlaceEnv(gym.Env):
     """
@@ -76,9 +81,11 @@ class KukaPickPlaceEnv(gym.Env):
             dtype=np.float32,
         )
 
-        # Observation: [4 arm_q, 4 arm_qdot, 2 gripper_q, 2 gripper_qdot,
-        #               target_xyz, ee_xyz] -> 18-D.
-        obs_dim = KUKA_ARM_JOINT_COUNT * 2 + 2 * 2 + 3 + 3
+        # Observation: [sin(q), cos(q), qdot, grip_pos, grip_vel,
+        #               relative_target, ee_pos, prev_action] -> 27-D.
+        # sin(q): 4, cos(q): 4, qdot: 4, grip_pos: 2, grip_vel: 2,
+        # relative_target: 3, ee_pos: 3, prev_action: 5
+        obs_dim = 4 + 4 + 4 + 2 + 2 + 3 + 3 + KUKA_ACTION_DIM  # 27
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -106,6 +113,7 @@ class KukaPickPlaceEnv(gym.Env):
         # Simulation handles
         self.plane_id = None
         self.robot_id = None
+        self.table_id = None
         self.target_id = None
 
         # Joint indices will be populated in _setup_pybullet_kuka.
@@ -126,6 +134,26 @@ class KukaPickPlaceEnv(gym.Env):
         """
         # Load ground plane
         self.plane_id = p.loadURDF("plane.urdf")
+
+        # Create table using a box primitive
+        table_collision = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=TABLE_HALF_EXTENTS
+        )
+        table_visual = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=TABLE_HALF_EXTENTS,
+            rgbaColor=[0.6, 0.4, 0.2, 1.0],  # Wood-brown color
+        )
+        self.table_id = p.createMultiBody(
+            baseMass=0.0,  # Static object
+            baseCollisionShapeIndex=table_collision,
+            baseVisualShapeIndex=table_visual,
+            basePosition=[
+                TABLE_POSITION[0],
+                TABLE_POSITION[1],
+                TABLE_HALF_EXTENTS[2],  # Raise so bottom touches ground
+            ],
+        )
 
         # Load the truncated 4-DOF KUKA URDF with gripper.
         if not os.path.exists(self._kuka_urdf_path):
@@ -185,40 +213,40 @@ class KukaPickPlaceEnv(gym.Env):
             )
 
     def _get_observation(self) -> np.ndarray:
-        """
-        Construct the observation vector:
-        [4 arm_q, 4 arm_qdot, 2 gripper_q, 2 gripper_qdot, target_xyz, ee_xyz]
-        """
-        # Arm joint states
         arm_states = p.getJointStates(self.robot_id, self.arm_joint_indices)
-        arm_angles = np.array([s[0] for s in arm_states], dtype=np.float32)
-        arm_vels = np.array([s[1] for s in arm_states], dtype=np.float32)
+        q = np.array([s[0] for s in arm_states], dtype=np.float32)
+        qdot = np.array([s[1] for s in arm_states], dtype=np.float32)
 
-        # Gripper joint states
+        sin_q = np.sin(q)
+        cos_q = np.cos(q)
+
         gripper_states = p.getJointStates(self.robot_id, self.gripper_joint_indices)
-        gripper_pos = np.array([s[0] for s in gripper_states], dtype=np.float32)
-        gripper_vels = np.array([s[1] for s in gripper_states], dtype=np.float32)
+        grip_pos = np.array([s[0] for s in gripper_states], dtype=np.float32)
+        grip_vel = np.array([s[1] for s in gripper_states], dtype=np.float32)
 
         ee_pos = np.array(
             p.getLinkState(
-                self.robot_id,
-                linkIndex=KUKA_EE_LINK_INDEX,
-                computeForwardKinematics=True,
+                self.robot_id, KUKA_EE_LINK_INDEX, computeForwardKinematics=True
             )[0],
             dtype=np.float32,
         )
         self.last_end_effector_pos = ee_pos
 
+        relative_target = self.target_pos.astype(np.float32) - ee_pos
+
         obs = np.concatenate(
             [
-                arm_angles,
-                arm_vels,
-                gripper_pos,
-                gripper_vels,
-                self.target_pos.astype(np.float32),
+                sin_q,
+                cos_q,
+                qdot,
+                grip_pos,
+                grip_vel,
+                relative_target,
                 ee_pos,
+                self.prev_action,
             ]
         ).astype(np.float32)
+
         return obs
 
     def reset(
@@ -251,11 +279,23 @@ class KukaPickPlaceEnv(gym.Env):
         for joint_idx in self.gripper_joint_indices:
             p.resetJointState(self.robot_id, joint_idx, 0.0, 0.0)
 
-        # Randomize target position in front of the base within the reachable workspace.
-        x = self.np_random.uniform(0.2, 0.6)
-        y = self.np_random.uniform(-0.3, 0.3)
-        z = self.np_random.uniform(0.3, 0.7)
+        # Randomize target position ON TOP of the table.
+        x = self.np_random.uniform(
+            TABLE_POSITION[0] - TABLE_HALF_EXTENTS[0] + 0.05,
+            TABLE_POSITION[0] + TABLE_HALF_EXTENTS[0] - 0.05,
+        )
+        y = self.np_random.uniform(
+            TABLE_POSITION[1] - TABLE_HALF_EXTENTS[1] + 0.05,
+            TABLE_POSITION[1] + TABLE_HALF_EXTENTS[1] - 0.05,
+        )
+        z = TABLE_HEIGHT + 0.05  # Slightly above table surface (sphere radius)
         self.target_pos = np.array([x, y, z], dtype=np.float32)
+
+        self.step_count = 0
+        self.prev_distance = float("inf")  # initialize for progress reward
+        self.prev_action = np.zeros(
+            KUKA_ACTION_DIM, dtype=np.float32
+        )  # for observation
 
         # Create a simple spherical target.
         target_collision = p.createCollisionShape(p.GEOM_SPHERE, radius=0.04)
@@ -326,7 +366,11 @@ class KukaPickPlaceEnv(gym.Env):
         """
         Run one timestep of the truncated 4-DOF KUKA with gripper reaching environment.
         """
+        action = np.clip(action, self.action_space.low, self.action_space.high)
         self._apply_action(action)
+
+        # Store action for next observation
+        self.prev_action = action.astype(np.float32)
 
         # Integrate physics for smoother motion.
         for _ in range(self.sim_substeps_per_step):
@@ -336,18 +380,40 @@ class KukaPickPlaceEnv(gym.Env):
 
         observation = self._get_observation()
 
-        # Distance-based reward.
         distance_to_target = float(
             np.linalg.norm(self.last_end_effector_pos - self.target_pos)
         )
-        reward = -distance_to_target
 
-        # Success bonus when close enough.
+        # shaping hyperparams (tunable)
+        k_progress = 20.0  # reward for reducing distance this step
+        k_distance = (
+            1.0  # small penalty proportional to distance (keeps agent focusing)
+        )
+        k_action = 0.01  # penalty on action magnitude to encourage smoothness
+
+        # compute progress reward
+        if self.prev_distance == float("inf"):
+            progress = 0.0
+        else:
+            progress = max(
+                0.0, self.prev_distance - distance_to_target
+            )  # only reward closing
+
+        action_penalty = -k_action * float(np.sum(np.square(action)))
+
+        reward = (
+            k_progress * progress - k_distance * distance_to_target + action_penalty
+        )
+
+        # success
         if distance_to_target < 0.05:
-            reward += 10.0
+            reward += 50.0
             terminated = True
         else:
             terminated = False
+
+        # update prev_distance
+        self.prev_distance = distance_to_target
 
         truncated = self.step_count >= self.max_episode_steps
 
@@ -361,12 +427,41 @@ class KukaPickPlaceEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def render(self):
-        """Render the environment (handled automatically by PyBullet GUI)."""
+        """Render the environment."""
         if self.render_mode == "human":
             time.sleep(1.0 / TARGET_FPS)
+            return None
         elif self.render_mode == "rgb_array":
-            # Could implement camera-based rendering here if needed.
-            pass
+            return self._get_camera_image()
+        return None
+
+    def _get_camera_image(self, width: int = 640, height: int = 480) -> np.ndarray:
+        """Capture an RGB image from a fixed camera viewpoint."""
+        view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0.0, 0.0, 0.4],
+            distance=1.5,
+            yaw=60,
+            pitch=-30,
+            roll=0,
+            upAxisIndex=2,
+        )
+        proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=float(width) / height,
+            nearVal=0.1,
+            farVal=100.0,
+        )
+        # Use TINY_RENDERER for headless compatibility (works without OpenGL display)
+        _, _, rgba, _, _ = p.getCameraImage(
+            width,
+            height,
+            viewMatrix=view_matrix,
+            projectionMatrix=proj_matrix,
+            renderer=p.ER_TINY_RENDERER,
+        )
+        # Convert RGBA to RGB (drop alpha channel)
+        rgb = np.array(rgba, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+        return rgb
 
     def close(self):
         """Clean up and close the environment."""
