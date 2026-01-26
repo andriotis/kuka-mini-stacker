@@ -48,12 +48,6 @@ TABLE_POSITION = [0.5, 0.0, 0.0]  # In front of the robot base
 TABLE_HALF_EXTENTS = [0.3, 0.4, 0.3]  # Half-size: 0.6m x 0.8m x 0.6m tall
 TABLE_HEIGHT = TABLE_HALF_EXTENTS[2] * 2  # Full height = 0.6m
 
-# Reward shaping constants
-REWARD_DISTANCE_SCALE = 1.2  # Dense negative distance penalty
-REWARD_ACTION_SCALE = 0.005  # Action magnitude penalty
-REWARD_SUCCESS_BONUS = 50.0  # Sparse success reward
-SUCCESS_DISTANCE_THRESHOLD = 0.05  # Distance threshold for success
-
 
 class KukaPickPlaceEnv(gym.Env):
     """
@@ -222,13 +216,6 @@ class KukaPickPlaceEnv(gym.Env):
             if joint_type != p.JOINT_FIXED:
                 self.movable_joint_indices.append(joint_idx)
 
-        # Build mapping: joint_idx -> position in IK output array.
-        # IK returns values only for movable joints, so we need this to extract
-        # the correct values for our arm joints.
-        self.joint_idx_to_ik_output_idx = {
-            joint_idx: i for i, joint_idx in enumerate(self.movable_joint_indices)
-        }
-
         # Disable default motors to allow explicit position control.
         all_actuated_joints = self.arm_joint_indices + self.gripper_joint_indices
         p.setJointMotorControlArray(
@@ -284,95 +271,35 @@ class KukaPickPlaceEnv(gym.Env):
 
         return obs
 
-    def _clip_to_joint_limits(
-        self, joint_indices: list, angles: np.ndarray
-    ) -> np.ndarray:
-        """
-        Clip joint angles to their URDF-defined limits.
-
-        Args:
-            joint_indices: List of joint indices to query limits for.
-            angles: Array of joint angles to clip.
-
-        Returns:
-            Clipped joint angles within valid limits.
-        """
-        clipped = np.copy(angles)
-        for i, joint_idx in enumerate(joint_indices):
-            info = p.getJointInfo(self.robot_id, joint_idx)
-            lower_limit = info[8]
-            upper_limit = info[9]
-            # Only clip if valid limits exist (lower < upper)
-            if lower_limit < upper_limit:
-                clipped[i] = np.clip(angles[i], lower_limit, upper_limit)
-        return clipped
-
     def _compute_ik(self, target_position: np.ndarray) -> np.ndarray:
         """
         Compute joint angles to reach target end-effector position using IK.
 
-        Uses only movable joints for IK parameters and correctly maps
-        the output back to arm joint indices.
+        Uses current joint positions as seed to find the nearest solution,
+        avoiding discontinuous jumps between different IK configurations.
 
         Args:
             target_position: Desired end-effector position [x, y, z].
 
         Returns:
-            Joint angles for the arm joints.
+            Joint angles for the arm joints (first KUKA_ARM_JOINT_COUNT joints).
         """
-        # Build IK parameters for MOVABLE joints only (excludes fixed joints).
-        # PyBullet IK returns values in the same order as movable joints.
-        rest_poses = []
-        lower_limits = []
-        upper_limits = []
-        joint_ranges = []
-        joint_damping = []
+        # Get current positions for all movable joints to seed the IK solver.
+        # This ensures continuity - IK finds a solution near the current config
+        # rather than potentially jumping to a completely different configuration.
+        current_positions = [
+            p.getJointState(self.robot_id, idx)[0] for idx in self.movable_joint_indices
+        ]
 
-        for joint_idx in self.movable_joint_indices:
-            # Current position as rest pose for continuity
-            rest_poses.append(p.getJointState(self.robot_id, joint_idx)[0])
-
-            info = p.getJointInfo(self.robot_id, joint_idx)
-            lower = info[8]
-            upper = info[9]
-            lower_limits.append(lower)
-            upper_limits.append(upper)
-
-            # Joint range: use actual range if valid, else default to 2*pi
-            if lower < upper:
-                joint_ranges.append(upper - lower)
-            else:
-                joint_ranges.append(2.0 * np.pi)
-
-            joint_damping.append(0.1)
-
-        # IK returns values for movable joints only, in order
-        ik_solution = p.calculateInverseKinematics(
+        joint_angles = p.calculateInverseKinematics(
             self.robot_id,
             KUKA_EE_LINK_INDEX,
             target_position.tolist(),
-            lowerLimits=lower_limits,
-            upperLimits=upper_limits,
-            jointRanges=joint_ranges,
-            restPoses=rest_poses,
-            jointDamping=joint_damping,
+            currentPositions=current_positions,
             maxNumIterations=100,
             residualThreshold=1e-4,
         )
-
-        # Extract arm joint values using the mapping from joint index to IK output position
-        arm_angles = np.array(
-            [
-                ik_solution[self.joint_idx_to_ik_output_idx[idx]]
-                for idx in self.arm_joint_indices
-            ],
-            dtype=np.float32,
-        )
-
-        # Clip to URDF-defined joint limits
-        arm_angles = self._clip_to_joint_limits(self.arm_joint_indices, arm_angles)
-
-        return arm_angles
+        return np.array(joint_angles[:KUKA_ARM_JOINT_COUNT], dtype=np.float32)
 
     def reset(
         self, seed: Optional[int] = None, options: Optional[dict] = None
@@ -417,6 +344,7 @@ class KukaPickPlaceEnv(gym.Env):
         self.target_pos = np.array([x, y, z], dtype=np.float32)
 
         self.step_count = 0
+        self.prev_distance = float("inf")  # initialize for progress reward
         self.prev_action = np.zeros(
             self.action_dim, dtype=np.float32
         )  # for observation
@@ -469,10 +397,8 @@ class KukaPickPlaceEnv(gym.Env):
             target_arm_angles = arm_angles + arm_deltas
             gripper_action = action[4] * KUKA_GRIPPER_DELTA_SCALE
 
-        # Clip arm angles to URDF-defined joint limits
-        target_arm_angles = self._clip_to_joint_limits(
-            self.arm_joint_indices, target_arm_angles
-        )
+        # Clip arm angles to valid range
+        target_arm_angles = np.clip(target_arm_angles, -np.pi, np.pi)
 
         p.setJointMotorControlArray(
             self.robot_id,
@@ -522,17 +448,36 @@ class KukaPickPlaceEnv(gym.Env):
             np.linalg.norm(self.last_end_effector_pos - self.target_pos)
         )
 
-        # Reward: dense negative distance + action penalty + sparse success bonus
+        # shaping hyperparams (tunable)
+        k_progress = 20.0  # reward for reducing distance this step
+        k_distance = (
+            1.0  # small penalty proportional to distance (keeps agent focusing)
+        )
+        k_action = 0.01  # penalty on action magnitude to encourage smoothness
+
+        # compute progress reward
+        if self.prev_distance == float("inf"):
+            progress = 0.0
+        else:
+            progress = max(
+                0.0, self.prev_distance - distance_to_target
+            )  # only reward closing
+
+        action_penalty = -k_action * float(np.sum(np.square(action)))
+
         reward = (
-            -REWARD_DISTANCE_SCALE * distance_to_target
-            - REWARD_ACTION_SCALE * float(np.sum(np.square(action)))
+            k_progress * progress - k_distance * distance_to_target + action_penalty
         )
 
-        if distance_to_target < SUCCESS_DISTANCE_THRESHOLD:
-            reward += REWARD_SUCCESS_BONUS
+        # success
+        if distance_to_target < 0.05:
+            reward += 50.0
             terminated = True
         else:
             terminated = False
+
+        # update prev_distance
+        self.prev_distance = distance_to_target
 
         truncated = self.step_count >= self.max_episode_steps
 
